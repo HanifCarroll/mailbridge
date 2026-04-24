@@ -14,7 +14,7 @@ use std::{env, fs};
 const FASTMAIL_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
 #[derive(Debug, Parser)]
-#[command(name = "mailbridge")]
+#[command(name = "mailbridge", version)]
 #[command(about = "Read-only mailbox bridge over gws Gmail profiles and Fastmail JMAP")]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
