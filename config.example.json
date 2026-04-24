@@ -1,0 +1,16 @@
+{
+  "accounts": {
+    "personal": {
+      "email": "person@example.com",
+      "config": "/home/you/.config/gws"
+    },
+    "domain": {
+      "email": "you@company.example",
+      "config": "/home/you/.config/gws-domain"
+    },
+    "fastmail": {
+      "email": "you@fastmail.example",
+      "config": "/home/you/.config/mailbridge/fastmail.env"
+    }
+  }
+}
