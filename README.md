@@ -1,11 +1,11 @@
 # mailbridge
 
-`mailbridge` is a read-only mailbox bridge for local automations and coding agents. It provides one JSON-oriented CLI over:
+`mailbridge` is a conservative mailbox bridge for local automations and coding agents. It provides one JSON-oriented CLI over:
 
 - Gmail accounts accessed through the local `gws` CLI
 - Fastmail accounts accessed through JMAP
 
-It is intentionally conservative: search, read, thread lookup, attachment download, and local evidence export only. It does not send, archive, delete, label, or otherwise mutate mailbox state.
+It is intentionally narrow: search, read, thread lookup, attachment download, local evidence export, and draft-only message creation. It does not send, archive, delete, label, or otherwise mutate mailbox state beyond creating a draft.
 
 ## Install
 
@@ -85,8 +85,47 @@ mailbridge pull --account personal --message-id MESSAGE_ID --out /tmp/mail-run -
 mailbridge --json attachments list --account personal --message-id MESSAGE_ID
 mailbridge --json attachments download --account personal --message-id MESSAGE_ID --out /tmp/mail-attachments
 
+mailbridge --json draft create --account domain --spec /tmp/mailbridge-draft.json
+
 mailbridge --json search --account domain "from:sender@example.com newer_than:7d" --limit 10
 mailbridge --json search --account fastmail "search text" --limit 10
+```
+
+## Draft Specs
+
+`draft create` creates a provider draft and never sends it. The command has no send subcommand and does not call Gmail `drafts.send` or JMAP `EmailSubmission/set`.
+
+Draft specs are JSON files:
+
+```json
+{
+  "to": ["person@example.com"],
+  "cc": [],
+  "bcc": [],
+  "replyTo": [],
+  "subject": "Example draft",
+  "text": "Draft body here.",
+  "attachments": ["/absolute/path/file.pdf"],
+  "screenshots": ["/absolute/path/screenshot.png"]
+}
+```
+
+Notes:
+
+- `from` is optional and defaults to the configured account email.
+- `text` or `html` must be non-empty.
+- At least one `to`, `cc`, or `bcc` recipient is required.
+- `attachments` and `screenshots` must use absolute file paths. Both are attached to the draft; `screenshots` is kept separate in the manifest for auditability.
+- Gmail drafts are created through `users.drafts.create` with a generated MIME message.
+- Fastmail drafts are created through JMAP `Email/set` in the Drafts mailbox with the `$draft` keyword.
+
+Gmail accounts need compose-capable OAuth scope before they can create drafts. Keep readonly access for search/read and add compose:
+
+```sh
+gws auth login --services gmail --scopes https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.compose
+
+GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/Users/hanifcarroll/.config/gws-hanif-domain \
+  gws auth login --services gmail --scopes https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.compose
 ```
 
 ## Output Artifacts

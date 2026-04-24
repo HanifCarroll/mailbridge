@@ -2,7 +2,7 @@
 name = "mailbridge"
 version = "0.1.0"
 edition = "2024"
-description = "Read-only mailbox bridge with one JSON CLI over Gmail via gws and Fastmail JMAP."
+description = "Mailbox bridge with one JSON CLI over Gmail via gws and Fastmail JMAP, including draft-only compose."
 license = "MIT"
 repository = "https://github.com/HanifCarroll/mailbridge"
 homepage = "https://github.com/HanifCarroll/mailbridge"

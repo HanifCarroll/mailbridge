@@ -15,7 +15,9 @@ const FASTMAIL_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
 #[derive(Debug, Parser)]
 #[command(name = "mailbridge", version)]
-#[command(about = "Read-only mailbox bridge over gws Gmail profiles and Fastmail JMAP")]
+#[command(
+    about = "Mailbox bridge over gws Gmail profiles and Fastmail JMAP with draft-only writes"
+)]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
     json: bool,
@@ -38,6 +40,8 @@ enum CliCommand {
     Thread(ThreadArgs),
     #[command(subcommand, about = "List or download message attachments")]
     Attachments(AttachmentsCommand),
+    #[command(subcommand, about = "Create provider drafts without sending")]
+    Draft(DraftCommand),
     #[command(about = "Pull messages and attachments into a local evidence directory")]
     Pull(PullArgs),
 }
@@ -48,6 +52,12 @@ enum AttachmentsCommand {
     List(AttachmentListArgs),
     #[command(about = "Download attachments for one message")]
     Download(AttachmentDownloadArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DraftCommand {
+    #[command(about = "Create a draft message from a JSON spec without sending")]
+    Create(DraftCreateArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,6 +145,14 @@ struct AttachmentDownloadArgs {
     message_id: String,
     #[arg(long)]
     out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct DraftCreateArgs {
+    #[arg(long, value_enum)]
+    account: AccountKind,
+    #[arg(long, help = "Path to a draft JSON spec")]
+    spec: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +269,102 @@ struct PullManifest {
     message_ids: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct DraftSpec {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    #[serde(default, alias = "replyTo")]
+    reply_to: Vec<String>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default, alias = "body", alias = "bodyText", alias = "body_text")]
+    text: Option<String>,
+    #[serde(default)]
+    html: Option<String>,
+    #[serde(default)]
+    attachments: Vec<PathBuf>,
+    #[serde(default)]
+    screenshots: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedDraft {
+    account: Account,
+    from: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
+    reply_to: Vec<String>,
+    subject: String,
+    text: Option<String>,
+    html: Option<String>,
+    files: Vec<DraftFile>,
+}
+
+#[derive(Debug, Clone)]
+struct DraftFile {
+    kind: DraftAttachmentKind,
+    source_path: PathBuf,
+    filename: String,
+    mime_type: String,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum DraftAttachmentKind {
+    Attachment,
+    Screenshot,
+}
+
+#[derive(Debug)]
+struct DraftProviderResult {
+    draft_id: String,
+    message_id: Option<String>,
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftCreateManifest {
+    account: AccountKind,
+    backend: String,
+    draft_id: String,
+    message_id: Option<String>,
+    thread_id: Option<String>,
+    subject: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    reply_to: Vec<String>,
+    bcc_count: usize,
+    attachment_count: usize,
+    screenshot_count: usize,
+    attachments: Vec<DraftCreatedAttachment>,
+    sent: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftCreatedAttachment {
+    kind: DraftAttachmentKind,
+    path: String,
+    filename: String,
+    mime_type: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct ParsedEmailAddress {
+    name: Option<String>,
+    email: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -280,6 +394,10 @@ fn main() -> Result<()> {
         CliCommand::Attachments(AttachmentsCommand::Download(args)) => {
             let manifest = download_attachments(args.account, &args.message_id, &args.out)?;
             output(cli.json, &manifest, render_attachment_download(&manifest))
+        }
+        CliCommand::Draft(DraftCommand::Create(args)) => {
+            let manifest = create_draft(args)?;
+            output(cli.json, &manifest, render_draft_create(&manifest))
         }
         CliCommand::Pull(args) => {
             ensure_pull_selector(&args)?;
@@ -508,6 +626,13 @@ fn render_attachment_download(manifest: &AttachmentDownloadManifest) -> String {
     )
 }
 
+fn render_draft_create(manifest: &DraftCreateManifest) -> String {
+    format!(
+        "Created draft {}\naccount: {:?}\nsubject: {}\nattachments: {}\nsent: false",
+        manifest.draft_id, manifest.account, manifest.subject, manifest.attachment_count
+    )
+}
+
 fn render_pull(manifest: &PullManifest) -> String {
     format!(
         "Pulled {} messages and {} attachments\nrun: {}\nmessages: {}\nevidence: {}\nattachments: {}",
@@ -714,6 +839,476 @@ fn download_attachments(
         attachment_count: attachments.len(),
         attachments,
     })
+}
+
+fn create_draft(args: DraftCreateArgs) -> Result<DraftCreateManifest> {
+    let spec = read_draft_spec(&args.spec)?;
+    let draft = prepare_draft(args.account, &spec)?;
+    let provider = match args.account {
+        AccountKind::Personal | AccountKind::Domain => create_gmail_draft(args.account, &draft)?,
+        AccountKind::Fastmail => create_fastmail_draft(&draft)?,
+    };
+    let attachments = draft
+        .files
+        .iter()
+        .map(|file| DraftCreatedAttachment {
+            kind: file.kind,
+            path: file.source_path.display().to_string(),
+            filename: file.filename.clone(),
+            mime_type: file.mime_type.clone(),
+            size_bytes: file.bytes.len() as u64,
+            sha256: file.sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(DraftCreateManifest {
+        account: args.account,
+        backend: draft.account.backend.clone(),
+        draft_id: provider.draft_id,
+        message_id: provider.message_id,
+        thread_id: provider.thread_id,
+        subject: draft.subject,
+        to: draft.to,
+        cc: draft.cc,
+        reply_to: draft.reply_to,
+        bcc_count: draft.bcc.len(),
+        attachment_count: draft.files.len(),
+        screenshot_count: draft
+            .files
+            .iter()
+            .filter(|file| file.kind == DraftAttachmentKind::Screenshot)
+            .count(),
+        attachments,
+        sent: false,
+    })
+}
+
+fn read_draft_spec(path: &Path) -> Result<DraftSpec> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+fn prepare_draft(account_kind: AccountKind, spec: &DraftSpec) -> Result<PreparedDraft> {
+    let acct = account(account_kind);
+    let from = spec
+        .from
+        .clone()
+        .unwrap_or_else(|| acct.email.clone())
+        .trim()
+        .to_string();
+    validate_address("from", &from)?;
+    validate_address_list("to", &spec.to)?;
+    validate_address_list("cc", &spec.cc)?;
+    validate_address_list("bcc", &spec.bcc)?;
+    validate_address_list("reply_to", &spec.reply_to)?;
+    if spec.to.is_empty() && spec.cc.is_empty() && spec.bcc.is_empty() {
+        bail!("draft spec must include at least one to, cc, or bcc recipient");
+    }
+    let subject = validate_header_value("subject", spec.subject.as_deref().unwrap_or(""))?;
+    let text = non_empty_body(spec.text.as_deref());
+    let html = non_empty_body(spec.html.as_deref());
+    if text.is_none() && html.is_none() {
+        bail!("draft spec must include non-empty text or html body content");
+    }
+    let files = load_draft_files(&spec.attachments, &spec.screenshots)?;
+    Ok(PreparedDraft {
+        account: acct,
+        from,
+        to: spec.to.clone(),
+        cc: spec.cc.clone(),
+        bcc: spec.bcc.clone(),
+        reply_to: spec.reply_to.clone(),
+        subject,
+        text,
+        html,
+        files,
+    })
+}
+
+fn non_empty_body(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn load_draft_files(attachments: &[PathBuf], screenshots: &[PathBuf]) -> Result<Vec<DraftFile>> {
+    let mut files = Vec::new();
+    for path in attachments {
+        files.push(load_draft_file(path, DraftAttachmentKind::Attachment)?);
+    }
+    for path in screenshots {
+        files.push(load_draft_file(path, DraftAttachmentKind::Screenshot)?);
+    }
+    Ok(files)
+}
+
+fn load_draft_file(path: &Path, kind: DraftAttachmentKind) -> Result<DraftFile> {
+    if !path.is_absolute() {
+        bail!(
+            "draft attachment paths must be absolute, got {}",
+            path.display()
+        );
+    }
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("draft attachment is not a file: {}", path.display());
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("attachment path has no valid file name: {}", path.display()))?
+        .to_string();
+    validate_header_value("attachment filename", &filename)?;
+    let mime_type = infer_mime_type(path);
+    let sha256 = sha256_bytes(&bytes);
+    Ok(DraftFile {
+        kind,
+        source_path: path.to_path_buf(),
+        filename,
+        mime_type,
+        bytes,
+        sha256,
+    })
+}
+
+fn create_gmail_draft(
+    account_kind: AccountKind,
+    draft: &PreparedDraft,
+) -> Result<DraftProviderResult> {
+    ensure_gmail_draft_scope(Path::new(&draft.account.config))?;
+    let mime = build_mime_message(draft)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mime.as_bytes());
+    let params = json!({ "userId": "me" });
+    let body = json!({ "message": { "raw": raw } });
+    let response = run_gws(
+        Path::new(&draft.account.config),
+        [
+            "gmail",
+            "users",
+            "drafts",
+            "create",
+            "--params",
+            &params.to_string(),
+            "--json",
+            &body.to_string(),
+        ],
+    )
+    .with_context(|| format!("create Gmail draft for {:?}", account_kind))?;
+    let created: GwsDraftResponse = parse_json_output(&response)?;
+    Ok(DraftProviderResult {
+        draft_id: created.id,
+        message_id: created
+            .message
+            .as_ref()
+            .and_then(|message| message.id.clone()),
+        thread_id: created.message.and_then(|message| message.thread_id),
+    })
+}
+
+fn ensure_gmail_draft_scope(config_dir: &Path) -> Result<()> {
+    let raw = run_gws(config_dir, ["auth", "status"])?;
+    let status: GwsAuthStatus = parse_json_output(&raw)?;
+    let scopes = status.scopes.unwrap_or_default();
+    if scopes.iter().any(|scope| {
+        matches!(
+            scope.as_str(),
+            "https://mail.google.com/"
+                | "https://www.googleapis.com/auth/gmail.modify"
+                | "https://www.googleapis.com/auth/gmail.compose"
+        )
+    }) {
+        return Ok(());
+    }
+    bail!(
+        "Gmail draft creation requires gmail.compose, gmail.modify, or mail.google.com scope. Current scopes: {}. Re-authenticate with: GOOGLE_WORKSPACE_CLI_CONFIG_DIR={} gws auth login --services gmail --scopes https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/gmail.compose",
+        if scopes.is_empty() {
+            "none".to_string()
+        } else {
+            scopes.join(",")
+        },
+        shell_quote(&config_dir.display().to_string())
+    )
+}
+
+fn create_fastmail_draft(draft: &PreparedDraft) -> Result<DraftProviderResult> {
+    let client = FastmailClient::new(Path::new(&draft.account.config))?;
+    client.create_draft(draft)
+}
+
+fn build_mime_message(draft: &PreparedDraft) -> Result<String> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "From: {}\r\n",
+        validate_header_value("from", &draft.from)?
+    ));
+    push_address_header(&mut out, "To", &draft.to)?;
+    push_address_header(&mut out, "Cc", &draft.cc)?;
+    push_address_header(&mut out, "Bcc", &draft.bcc)?;
+    push_address_header(&mut out, "Reply-To", &draft.reply_to)?;
+    out.push_str(&format!(
+        "Subject: {}\r\n",
+        validate_header_value("subject", &draft.subject)?
+    ));
+    out.push_str(&format!("Date: {}\r\n", chrono::Utc::now().to_rfc2822()));
+    out.push_str("MIME-Version: 1.0\r\n");
+
+    if draft.files.is_empty() {
+        push_mime_body(&mut out, draft)?;
+    } else {
+        let mixed_boundary = mime_boundary("mixed");
+        out.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=\"{mixed_boundary}\"\r\n\r\n"
+        ));
+        out.push_str(&format!("--{mixed_boundary}\r\n"));
+        push_mime_body(&mut out, draft)?;
+        for file in &draft.files {
+            out.push_str(&format!("--{mixed_boundary}\r\n"));
+            push_mime_attachment(&mut out, file)?;
+        }
+        out.push_str(&format!("--{mixed_boundary}--\r\n"));
+    }
+    Ok(out)
+}
+
+fn push_mime_body(out: &mut String, draft: &PreparedDraft) -> Result<()> {
+    match (draft.text.as_deref(), draft.html.as_deref()) {
+        (Some(text), Some(html)) => {
+            let boundary = mime_boundary("alternative");
+            out.push_str(&format!(
+                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
+            ));
+            out.push_str(&format!("--{boundary}\r\n"));
+            push_text_part(out, "text/plain", text);
+            out.push_str(&format!("--{boundary}\r\n"));
+            push_text_part(out, "text/html", html);
+            out.push_str(&format!("--{boundary}--\r\n\r\n"));
+        }
+        (Some(text), None) => push_text_part(out, "text/plain", text),
+        (None, Some(html)) => push_text_part(out, "text/html", html),
+        (None, None) => bail!("draft body is empty"),
+    }
+    Ok(())
+}
+
+fn push_text_part(out: &mut String, mime_type: &str, body: &str) {
+    out.push_str(&format!(
+        "Content-Type: {mime_type}; charset=\"UTF-8\"\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n\r\n",
+        normalize_body(body)
+    ));
+}
+
+fn push_mime_attachment(out: &mut String, file: &DraftFile) -> Result<()> {
+    let filename = escape_quoted_header_value(&file.filename)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&file.bytes);
+    out.push_str(&format!(
+        "Content-Type: {}; name=\"{}\"\r\nContent-Disposition: attachment; filename=\"{}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+        file.mime_type, filename, filename
+    ));
+    out.push_str(&wrap_base64(&encoded));
+    out.push_str("\r\n");
+    Ok(())
+}
+
+fn push_address_header(out: &mut String, name: &str, addresses: &[String]) -> Result<()> {
+    if addresses.is_empty() {
+        return Ok(());
+    }
+    let values = addresses
+        .iter()
+        .map(|address| validate_header_value(name, address))
+        .collect::<Result<Vec<_>>>()?;
+    out.push_str(&format!("{name}: {}\r\n", values.join(", ")));
+    Ok(())
+}
+
+fn validate_address_list(label: &str, addresses: &[String]) -> Result<()> {
+    for address in addresses {
+        validate_address(label, address)?;
+    }
+    Ok(())
+}
+
+fn validate_address(label: &str, address: &str) -> Result<()> {
+    let value = validate_header_value(label, address)?;
+    let parsed = parse_email_address(&value)?;
+    if parsed.email.is_empty() || !parsed.email.contains('@') {
+        bail!("{label} must contain a valid email address");
+    }
+    Ok(())
+}
+
+fn validate_header_value(label: &str, value: &str) -> Result<String> {
+    if value.contains('\r') || value.contains('\n') {
+        bail!("{label} cannot contain newline characters");
+    }
+    Ok(value.trim().to_string())
+}
+
+fn escape_quoted_header_value(value: &str) -> Result<String> {
+    let value = validate_header_value("quoted header value", value)?;
+    Ok(value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn parse_email_address(value: &str) -> Result<ParsedEmailAddress> {
+    let trimmed = validate_header_value("email address", value)?;
+    if let Some(start) = trimmed.rfind('<')
+        && trimmed.ends_with('>')
+        && start < trimmed.len() - 1
+    {
+        let name = trimmed[..start].trim().trim_matches('"').trim();
+        let email = trimmed[start + 1..trimmed.len() - 1].trim();
+        return Ok(ParsedEmailAddress {
+            name: (!name.is_empty()).then(|| name.to_string()),
+            email: email.to_string(),
+        });
+    }
+    Ok(ParsedEmailAddress {
+        name: None,
+        email: trimmed,
+    })
+}
+
+fn jmap_email_addresses(addresses: &[String]) -> Result<Vec<Value>> {
+    addresses
+        .iter()
+        .map(|address| {
+            let parsed = parse_email_address(address)?;
+            Ok(json!({
+                "name": parsed.name,
+                "email": parsed.email
+            }))
+        })
+        .collect()
+}
+
+fn normalize_body(body: &str) -> String {
+    body.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
+fn wrap_base64(encoded: &str) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    while start < encoded.len() {
+        let end = (start + 76).min(encoded.len());
+        out.push_str(&encoded[start..end]);
+        out.push_str("\r\n");
+        start = end;
+    }
+    out
+}
+
+fn mime_boundary(prefix: &str) -> String {
+    format!(
+        "mailbridge-{prefix}-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    )
+}
+
+fn infer_mime_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("csv") => "text/csv",
+        Some("json") => "application/json",
+        Some("html") | Some("htm") => "text/html",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn jmap_body_structure(
+    draft: &PreparedDraft,
+    uploaded: &[FastmailUploadResponse],
+) -> (Value, Value) {
+    let mut body_values = serde_json::Map::new();
+    let body_part = match (draft.text.as_deref(), draft.html.as_deref()) {
+        (Some(text), Some(html)) => {
+            body_values.insert("text".to_string(), json!({ "value": text }));
+            body_values.insert("html".to_string(), json!({ "value": html }));
+            json!({
+                "type": "multipart/alternative",
+                "subParts": [
+                    {
+                        "partId": "text",
+                        "type": "text/plain",
+                        "charset": "utf-8",
+                        "disposition": "inline",
+                        "size": text.len()
+                    },
+                    {
+                        "partId": "html",
+                        "type": "text/html",
+                        "charset": "utf-8",
+                        "disposition": "inline",
+                        "size": html.len()
+                    }
+                ]
+            })
+        }
+        (Some(text), None) => {
+            body_values.insert("text".to_string(), json!({ "value": text }));
+            json!({
+                "partId": "text",
+                "type": "text/plain",
+                "charset": "utf-8",
+                "disposition": "inline",
+                "size": text.len()
+            })
+        }
+        (None, Some(html)) => {
+            body_values.insert("html".to_string(), json!({ "value": html }));
+            json!({
+                "partId": "html",
+                "type": "text/html",
+                "charset": "utf-8",
+                "disposition": "inline",
+                "size": html.len()
+            })
+        }
+        (None, None) => json!({
+            "partId": "text",
+            "type": "text/plain",
+            "charset": "utf-8",
+            "disposition": "inline",
+            "size": 0
+        }),
+    };
+    if uploaded.is_empty() {
+        return (body_part, Value::Object(body_values));
+    }
+    let mut sub_parts = vec![body_part];
+    for (index, (file, upload)) in draft.files.iter().zip(uploaded.iter()).enumerate() {
+        sub_parts.push(json!({
+            "partId": format!("attachment{}", index + 1),
+            "blobId": upload.blob_id.clone(),
+            "type": upload.mime_type.clone(),
+            "size": upload.size,
+            "name": file.filename.clone(),
+            "disposition": "attachment"
+        }));
+    }
+    (
+        json!({
+            "type": "multipart/mixed",
+            "subParts": sub_parts
+        }),
+        Value::Object(body_values),
+    )
 }
 
 fn resolve_pull_messages(args: &PullArgs) -> Result<(String, Vec<MessageDetail>)> {
@@ -1433,6 +2028,127 @@ impl FastmailClient {
         Ok(response.bytes()?.to_vec())
     }
 
+    fn create_draft(&self, draft: &PreparedDraft) -> Result<DraftProviderResult> {
+        let session = self.session()?;
+        let account_id = session.mail_account_id()?;
+        let drafts_mailbox_id = self.drafts_mailbox_id(&session, &account_id)?;
+        let uploaded = draft
+            .files
+            .iter()
+            .map(|file| self.upload_blob(&session, &account_id, file))
+            .collect::<Result<Vec<_>>>()?;
+        let (body_structure, body_values) = jmap_body_structure(draft, &uploaded);
+        let from = parse_email_address(&draft.from)?;
+        let mut mailbox_ids = serde_json::Map::new();
+        mailbox_ids.insert(drafts_mailbox_id, json!(true));
+        let mut email = json!({
+            "mailboxIds": Value::Object(mailbox_ids),
+            "keywords": { "$draft": true },
+            "from": [{ "name": from.name, "email": from.email }],
+            "to": jmap_email_addresses(&draft.to)?,
+            "subject": draft.subject.clone(),
+            "bodyStructure": body_structure,
+            "bodyValues": body_values
+        });
+        if !draft.cc.is_empty() {
+            email["cc"] = json!(jmap_email_addresses(&draft.cc)?);
+        }
+        if !draft.bcc.is_empty() {
+            email["bcc"] = json!(jmap_email_addresses(&draft.bcc)?);
+        }
+        if !draft.reply_to.is_empty() {
+            email["replyTo"] = json!(jmap_email_addresses(&draft.reply_to)?);
+        }
+        let response = self.api_call(
+            &session.api_url,
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [[
+                    "Email/set",
+                    {
+                        "accountId": account_id,
+                        "create": {
+                            "draft": email
+                        }
+                    },
+                    "d"
+                ]]
+            }),
+        )?;
+        let value = response.method_response("Email/set")?;
+        if let Some(not_created) = value.get("notCreated").filter(|value| !value.is_null()) {
+            bail!("Fastmail draft creation rejected: {not_created}");
+        }
+        let created = value
+            .get("created")
+            .and_then(|created| created.get("draft"))
+            .cloned()
+            .ok_or_else(|| anyhow!("Email/set response missing created draft"))?;
+        let created: FastmailSetCreated =
+            serde_json::from_value(created).with_context(|| "parse Email/set created draft")?;
+        Ok(DraftProviderResult {
+            draft_id: created.id.clone(),
+            message_id: Some(created.id),
+            thread_id: created.thread_id,
+        })
+    }
+
+    fn drafts_mailbox_id(&self, session: &FastmailSession, account_id: &str) -> Result<String> {
+        let response = self.api_call(
+            &session.api_url,
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [[
+                    "Mailbox/get",
+                    {
+                        "accountId": account_id,
+                        "properties": ["id", "name", "role"]
+                    },
+                    "m"
+                ]]
+            }),
+        )?;
+        let value = response.method_response("Mailbox/get")?;
+        let list = value
+            .get("list")
+            .cloned()
+            .ok_or_else(|| anyhow!("Mailbox/get response missing list"))?;
+        let mailboxes: Vec<FastmailMailbox> =
+            serde_json::from_value(list).with_context(|| "parse Mailbox/get list")?;
+        mailboxes
+            .iter()
+            .find(|mailbox| mailbox.role.as_deref() == Some("drafts"))
+            .or_else(|| {
+                mailboxes
+                    .iter()
+                    .find(|mailbox| mailbox.name.eq_ignore_ascii_case("Drafts"))
+            })
+            .map(|mailbox| mailbox.id.clone())
+            .ok_or_else(|| anyhow!("Fastmail Drafts mailbox not found"))
+    }
+
+    fn upload_blob(
+        &self,
+        session: &FastmailSession,
+        account_id: &str,
+        file: &DraftFile,
+    ) -> Result<FastmailUploadResponse> {
+        let url = session.upload_url.replace("{accountId}", account_id);
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .header("Content-Type", &file.mime_type)
+            .body(file.bytes.clone())
+            .send()
+            .with_context(|| format!("upload Fastmail blob {}", file.filename))?
+            .error_for_status()
+            .with_context(|| format!("Fastmail blob upload failed for {}", file.filename))?;
+        response
+            .json()
+            .with_context(|| format!("parse Fastmail blob upload response for {}", file.filename))
+    }
+
     fn api_call(&self, api_url: &str, body: Value) -> Result<JmapResponse> {
         let response = self
             .http
@@ -1716,11 +2432,26 @@ struct GwsReadMessage {
 }
 
 #[derive(Debug, Deserialize)]
+struct GwsDraftResponse {
+    id: String,
+    message: Option<GwsDraftMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GwsDraftMessage {
+    id: Option<String>,
+    #[serde(default, alias = "threadId")]
+    thread_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct FastmailSession {
     #[serde(alias = "apiUrl")]
     api_url: String,
     #[serde(alias = "downloadUrl")]
     download_url: String,
+    #[serde(alias = "uploadUrl")]
+    upload_url: String,
     #[serde(alias = "primaryAccounts")]
     primary_accounts: BTreeMap<String, String>,
     username: Option<String>,
@@ -1780,6 +2511,29 @@ struct FastmailEmail {
 struct FastmailThread {
     #[serde(alias = "emailIds")]
     email_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FastmailMailbox {
+    id: String,
+    name: String,
+    role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FastmailUploadResponse {
+    #[serde(alias = "blobId")]
+    blob_id: String,
+    #[serde(alias = "type")]
+    mime_type: String,
+    size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct FastmailSetCreated {
+    id: String,
+    #[serde(default, alias = "threadId")]
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1930,5 +2684,89 @@ mod tests {
         };
         assert_eq!(header_value(&payload, "subject").as_deref(), Some("Hello"));
         assert_eq!(attachment_filename_list(&payload), vec!["file.pdf"]);
+    }
+
+    #[test]
+    fn draft_command_does_not_expose_send_subcommand() {
+        let parsed = Cli::try_parse_from(["mailbridge", "draft", "send"]);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn rejects_relative_draft_attachment_paths() {
+        let error = load_draft_file(Path::new("screenshot.png"), DraftAttachmentKind::Screenshot)
+            .unwrap_err();
+        assert!(error.to_string().contains("must be absolute"));
+    }
+
+    #[test]
+    fn builds_mime_draft_with_screenshot_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let screenshot = dir.path().join("screen.png");
+        fs::write(&screenshot, b"png-bytes").unwrap();
+        let file = load_draft_file(&screenshot, DraftAttachmentKind::Screenshot).unwrap();
+        let draft = PreparedDraft {
+            account: Account {
+                id: AccountKind::Domain,
+                email: "me@example.com".to_string(),
+                backend: "gmail-gws".to_string(),
+                config: "/tmp/gws".to_string(),
+            },
+            from: "me@example.com".to_string(),
+            to: vec!["you@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            subject: "Screenshot draft".to_string(),
+            text: Some("Please see attached.".to_string()),
+            html: None,
+            files: vec![file],
+        };
+        let mime = build_mime_message(&draft).unwrap();
+
+        assert!(mime.contains("To: you@example.com"));
+        assert!(mime.contains("Subject: Screenshot draft"));
+        assert!(mime.contains("Content-Type: multipart/mixed"));
+        assert!(mime.contains("Content-Type: image/png; name=\"screen.png\""));
+        assert!(mime.contains("Content-Disposition: attachment; filename=\"screen.png\""));
+    }
+
+    #[test]
+    fn builds_jmap_body_structure_with_uploaded_attachment() {
+        let draft = PreparedDraft {
+            account: Account {
+                id: AccountKind::Fastmail,
+                email: "me@example.com".to_string(),
+                backend: "fastmail-jmap".to_string(),
+                config: "/tmp/fastmail.env".to_string(),
+            },
+            from: "me@example.com".to_string(),
+            to: vec!["you@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            reply_to: Vec::new(),
+            subject: "Fastmail draft".to_string(),
+            text: Some("Body".to_string()),
+            html: None,
+            files: vec![DraftFile {
+                kind: DraftAttachmentKind::Attachment,
+                source_path: PathBuf::from("/tmp/file.pdf"),
+                filename: "file.pdf".to_string(),
+                mime_type: "application/pdf".to_string(),
+                bytes: b"pdf".to_vec(),
+                sha256: sha256_bytes(b"pdf"),
+            }],
+        };
+        let uploaded = vec![FastmailUploadResponse {
+            blob_id: "blob-1".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size: 3,
+        }];
+        let (structure, values) = jmap_body_structure(&draft, &uploaded);
+
+        assert_eq!(structure["type"], "multipart/mixed");
+        assert_eq!(structure["subParts"][1]["blobId"], "blob-1");
+        assert_eq!(structure["subParts"][1]["disposition"], "attachment");
+        assert_eq!(values["text"]["value"], "Body");
     }
 }
