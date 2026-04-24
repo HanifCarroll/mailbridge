@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 const FASTMAIL_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
@@ -979,9 +980,9 @@ fn create_gmail_draft(
 ) -> Result<DraftProviderResult> {
     ensure_gmail_draft_scope(Path::new(&draft.account.config))?;
     let mime = build_mime_message(draft)?;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mime.as_bytes());
+    let mime_path = write_gmail_upload_mime(&mime)?;
+    let mime_path_arg = mime_path.to_string_lossy().to_string();
     let params = json!({ "userId": "me" });
-    let body = json!({ "message": { "raw": raw } });
     let response = run_gws(
         Path::new(&draft.account.config),
         [
@@ -991,11 +992,18 @@ fn create_gmail_draft(
             "create",
             "--params",
             &params.to_string(),
+            "--upload",
+            &mime_path_arg,
+            "--upload-content-type",
+            "message/rfc822",
             "--json",
-            &body.to_string(),
+            "{}",
         ],
-    )
-    .with_context(|| format!("create Gmail draft for {:?}", account_kind))?;
+    );
+    let cleanup = fs::remove_file(&mime_path)
+        .with_context(|| format!("remove Gmail draft upload {}", mime_path.display()));
+    let response = response.with_context(|| format!("create Gmail draft for {:?}", account_kind))?;
+    cleanup?;
     let created: GwsDraftResponse = parse_json_output(&response)?;
     Ok(DraftProviderResult {
         draft_id: created.id,
@@ -1005,6 +1013,20 @@ fn create_gmail_draft(
             .and_then(|message| message.id.clone()),
         thread_id: created.message.and_then(|message| message.thread_id),
     })
+}
+
+fn write_gmail_upload_mime(mime: &str) -> Result<PathBuf> {
+    let cwd = env::current_dir().with_context(|| "read current directory for Gmail draft upload")?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = cwd.join(format!(
+        ".mailbridge-draft-upload-{}-{nonce}.eml",
+        std::process::id()
+    ));
+    fs::write(&path, mime).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
 }
 
 fn ensure_gmail_draft_scope(config_dir: &Path) -> Result<()> {
@@ -2729,6 +2751,15 @@ mod tests {
         assert!(mime.contains("Content-Type: multipart/mixed"));
         assert!(mime.contains("Content-Type: image/png; name=\"screen.png\""));
         assert!(mime.contains("Content-Disposition: attachment; filename=\"screen.png\""));
+    }
+
+    #[test]
+    fn writes_gmail_upload_mime_in_current_dir() {
+        let cwd = env::current_dir().unwrap();
+        let path = write_gmail_upload_mime("Subject: Test\r\n\r\nBody").unwrap();
+        assert!(path.starts_with(cwd));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "Subject: Test\r\n\r\nBody");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
