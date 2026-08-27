@@ -16,9 +16,7 @@ const FASTMAIL_SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 
 #[derive(Debug, Parser)]
 #[command(name = "mailbridge", version)]
-#[command(
-    about = "Mailbox bridge over gws Gmail profiles and Fastmail JMAP with draft-only writes"
-)]
+#[command(about = "Mailbox bridge over gws Gmail profiles and Fastmail JMAP with narrow writes")]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
     json: bool,
@@ -39,6 +37,8 @@ enum CliCommand {
     Read(ReadArgs),
     #[command(about = "Read one thread")]
     Thread(ThreadArgs),
+    #[command(about = "Archive explicit Fastmail message IDs")]
+    Archive(ArchiveArgs),
     #[command(subcommand, about = "List or download message attachments")]
     Attachments(AttachmentsCommand),
     #[command(subcommand, about = "Create provider drafts without sending")]
@@ -99,6 +99,14 @@ struct ThreadArgs {
         help = "Fastmail only: recent messages to scan for matching thread id"
     )]
     scan_limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct ArchiveArgs {
+    #[arg(long, value_enum)]
+    account: AccountKind,
+    #[arg(long = "message-id", aliases = ["id"], required = true)]
+    message_ids: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -360,6 +368,29 @@ struct DraftCreatedAttachment {
     sha256: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ArchiveReport {
+    account: AccountKind,
+    results: Vec<ArchiveResult>,
+    succeeded: usize,
+    failed: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ArchiveResult {
+    message_id: String,
+    status: String,
+    mailbox_ids: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ArchiveDisposition {
+    NeedsMove,
+    AlreadyArchived,
+    NotInInboxOrArchive,
+}
+
 #[derive(Debug)]
 struct ParsedEmailAddress {
     name: Option<String>,
@@ -387,6 +418,14 @@ fn main() -> Result<()> {
         CliCommand::Thread(args) => {
             let thread = thread_account(args.account, &args.thread_id, args.scan_limit, true)?;
             output(cli.json, &thread, render_thread(&thread))
+        }
+        CliCommand::Archive(args) => {
+            let report = archive_messages(args)?;
+            output(cli.json, &report, render_archive(&report))?;
+            if report.failed > 0 {
+                bail!("{} archive operation(s) failed", report.failed);
+            }
+            Ok(())
         }
         CliCommand::Attachments(AttachmentsCommand::List(args)) => {
             let attachments = list_attachments(args.account, &args.message_id)?;
@@ -595,6 +634,25 @@ fn render_thread(thread: &ThreadDetail) -> String {
         thread.thread_id,
         thread.messages.len()
     )
+}
+
+fn render_archive(report: &ArchiveReport) -> String {
+    report
+        .results
+        .iter()
+        .map(|item| {
+            format!(
+                "{}: {}{}",
+                item.message_id,
+                item.status,
+                item.error
+                    .as_deref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_attachment_list(list: &AttachmentList) -> String {
@@ -883,6 +941,27 @@ fn create_draft(args: DraftCreateArgs) -> Result<DraftCreateManifest> {
     })
 }
 
+fn archive_messages(args: ArchiveArgs) -> Result<ArchiveReport> {
+    if args.account != AccountKind::Fastmail {
+        bail!("archive is supported only for the Fastmail account");
+    }
+    if args.message_ids.iter().any(|id| id.trim().is_empty()) {
+        bail!("message IDs must not be empty");
+    }
+    let client = FastmailClient::new(Path::new(&account(args.account).config))?;
+    let results = client.archive(&args.message_ids)?;
+    let failed = results
+        .iter()
+        .filter(|result| result.error.is_some())
+        .count();
+    Ok(ArchiveReport {
+        account: args.account,
+        results,
+        succeeded: args.message_ids.len() - failed,
+        failed,
+    })
+}
+
 fn read_draft_spec(path: &Path) -> Result<DraftSpec> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
@@ -1002,7 +1081,8 @@ fn create_gmail_draft(
     );
     let cleanup = fs::remove_file(&mime_path)
         .with_context(|| format!("remove Gmail draft upload {}", mime_path.display()));
-    let response = response.with_context(|| format!("create Gmail draft for {:?}", account_kind))?;
+    let response =
+        response.with_context(|| format!("create Gmail draft for {:?}", account_kind))?;
     cleanup?;
     let created: GwsDraftResponse = parse_json_output(&response)?;
     Ok(DraftProviderResult {
@@ -1016,7 +1096,8 @@ fn create_gmail_draft(
 }
 
 fn write_gmail_upload_mime(mime: &str) -> Result<PathBuf> {
-    let cwd = env::current_dir().with_context(|| "read current directory for Gmail draft upload")?;
+    let cwd =
+        env::current_dir().with_context(|| "read current directory for Gmail draft upload")?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -1931,6 +2012,162 @@ impl FastmailClient {
             .with_context(|| "parse Fastmail JMAP session")
     }
 
+    fn archive(&self, ids: &[String]) -> Result<Vec<ArchiveResult>> {
+        let session = self.session()?;
+        let account_id = session.mail_account_id()?;
+        let (inbox_id, archive_id) = self.archive_mailbox_ids(&session, &account_id)?;
+        let messages = self.email_get(ids, false)?;
+        let messages = messages
+            .into_iter()
+            .map(|message| (message.id.clone(), message))
+            .collect::<BTreeMap<_, _>>();
+
+        ids.iter()
+            .map(|id| {
+                let Some(message) = messages.get(id) else {
+                    return Ok(ArchiveResult {
+                        message_id: id.clone(),
+                        status: "failed".to_string(),
+                        mailbox_ids: Vec::new(),
+                        error: Some("message not found".to_string()),
+                    });
+                };
+                let before = active_mailbox_ids(&message.mailbox_ids);
+                let before_other = other_mailbox_ids(&message.mailbox_ids, &inbox_id, &archive_id);
+                let disposition = archive_disposition(&message.mailbox_ids, &inbox_id, &archive_id);
+                let mut error = (disposition == ArchiveDisposition::NotInInboxOrArchive)
+                    .then(|| "message is in neither Inbox nor Archive".to_string());
+                if disposition == ArchiveDisposition::NeedsMove
+                    && let Err(write_error) =
+                        self.archive_message(&session, &account_id, id, &archive_id, &inbox_id)
+                {
+                    error = Some(write_error.to_string());
+                }
+
+                let verified = self.email_get(std::slice::from_ref(id), false);
+                match verified {
+                    Ok(messages) => {
+                        let Some(message) = messages.into_iter().next() else {
+                            return Ok(ArchiveResult {
+                                message_id: id.clone(),
+                                status: "failed".to_string(),
+                                mailbox_ids: before,
+                                error: Some("message disappeared during verification".to_string()),
+                            });
+                        };
+                        let mailbox_ids = active_mailbox_ids(&message.mailbox_ids);
+                        let inbox_removed =
+                            !message.mailbox_ids.get(&inbox_id).copied().unwrap_or(false);
+                        let archive_present = message
+                            .mailbox_ids
+                            .get(&archive_id)
+                            .copied()
+                            .unwrap_or(false);
+                        let others_preserved =
+                            other_mailbox_ids(&message.mailbox_ids, &inbox_id, &archive_id)
+                                == before_other;
+                        if !archive_present {
+                            error = Some(match error {
+                                Some(error) => format!("{error}; Archive membership missing"),
+                                None => "Archive membership missing after verification".to_string(),
+                            });
+                        }
+                        if !inbox_removed {
+                            error = Some(match error {
+                                Some(error) => format!("{error}; Inbox membership still present"),
+                                None => {
+                                    "Inbox membership still present after verification".to_string()
+                                }
+                            });
+                        } else if !others_preserved {
+                            error = Some(match error {
+                                Some(error) => format!("{error}; other mailbox membership changed"),
+                                None => "other mailbox membership changed".to_string(),
+                            });
+                        }
+                        Ok(ArchiveResult {
+                            message_id: id.clone(),
+                            status: if error.is_some() {
+                                "failed"
+                            } else if disposition == ArchiveDisposition::NeedsMove {
+                                "archived"
+                            } else {
+                                "already-archived"
+                            }
+                            .to_string(),
+                            mailbox_ids,
+                            error,
+                        })
+                    }
+                    Err(verify_error) => Ok(ArchiveResult {
+                        message_id: id.clone(),
+                        status: "failed".to_string(),
+                        mailbox_ids: before,
+                        error: Some(format!("verification failed: {verify_error}")),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn archive_message(
+        &self,
+        session: &FastmailSession,
+        account_id: &str,
+        message_id: &str,
+        archive_id: &str,
+        inbox_id: &str,
+    ) -> Result<()> {
+        let response = self.api_call(
+            &session.api_url,
+            email_set_archive_body(account_id, message_id, archive_id, inbox_id),
+        )?;
+        let value = response.method_response("Email/set")?;
+        if value
+            .get("updated")
+            .and_then(|updated| updated.get(message_id))
+            .is_none()
+        {
+            bail!("Fastmail archive rejected for message {message_id}");
+        }
+        Ok(())
+    }
+
+    fn archive_mailbox_ids(
+        &self,
+        session: &FastmailSession,
+        account_id: &str,
+    ) -> Result<(String, String)> {
+        let response = self.api_call(
+            &session.api_url,
+            json!({
+                "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                "methodCalls": [["Mailbox/get", {
+                    "accountId": account_id,
+                    "properties": ["id", "name", "role"]
+                }, "m"]]
+            }),
+        )?;
+        let list = response
+            .method_response("Mailbox/get")?
+            .get("list")
+            .cloned()
+            .ok_or_else(|| anyhow!("Mailbox/get response missing list"))?;
+        let mailboxes = serde_json::from_value::<Vec<FastmailMailbox>>(list)
+            .with_context(|| "parse Mailbox/get list")?;
+        let inbox_id = mailboxes
+            .iter()
+            .find(|mailbox| mailbox.role.as_deref() == Some("inbox"))
+            .map(|mailbox| mailbox.id.clone())
+            .ok_or_else(|| anyhow!("Fastmail Inbox mailbox with role inbox not found"))?;
+        let archive_id = mailboxes
+            .iter()
+            .find(|mailbox| mailbox.role.as_deref() == Some("archive"))
+            .map(|mailbox| mailbox.id.clone())
+            .ok_or_else(|| anyhow!("Fastmail Archive mailbox with role archive not found"))?;
+        Ok((inbox_id, archive_id))
+    }
+
     fn email_query(&self, text: Option<&str>, limit: usize) -> Result<Vec<String>> {
         let session = self.session()?;
         let account_id = session.mail_account_id()?;
@@ -2185,6 +2422,72 @@ impl FastmailClient {
             .json()
             .with_context(|| "parse Fastmail JMAP response")
     }
+}
+
+fn archive_disposition(
+    mailbox_ids: &BTreeMap<String, bool>,
+    inbox_id: &str,
+    archive_id: &str,
+) -> ArchiveDisposition {
+    let in_inbox = mailbox_ids.get(inbox_id).copied().unwrap_or(false);
+    let in_archive = mailbox_ids.get(archive_id).copied().unwrap_or(false);
+    if in_inbox {
+        ArchiveDisposition::NeedsMove
+    } else if in_archive {
+        ArchiveDisposition::AlreadyArchived
+    } else {
+        ArchiveDisposition::NotInInboxOrArchive
+    }
+}
+
+fn active_mailbox_ids(mailbox_ids: &BTreeMap<String, bool>) -> Vec<String> {
+    mailbox_ids
+        .iter()
+        .filter(|(_, active)| **active)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+fn other_mailbox_ids(
+    mailbox_ids: &BTreeMap<String, bool>,
+    inbox_id: &str,
+    archive_id: &str,
+) -> Vec<String> {
+    mailbox_ids
+        .iter()
+        .filter(|(id, active)| **active && id.as_str() != inbox_id && id.as_str() != archive_id)
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+fn email_set_archive_body(
+    account_id: &str,
+    message_id: &str,
+    archive_id: &str,
+    inbox_id: &str,
+) -> Value {
+    let mut patch = serde_json::Map::new();
+    patch.insert(
+        format!("mailboxIds/{}", json_pointer_escape(archive_id)),
+        json!(true),
+    );
+    patch.insert(
+        format!("mailboxIds/{}", json_pointer_escape(inbox_id)),
+        Value::Null,
+    );
+    let mut update = serde_json::Map::new();
+    update.insert(message_id.to_string(), Value::Object(patch));
+    json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Email/set", {
+            "accountId": account_id,
+            "update": update
+        }, "a"]]
+    })
+}
+
+fn json_pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 fn parse_json_output<T: DeserializeOwned>(raw: &str) -> Result<T> {
@@ -2512,6 +2815,8 @@ impl JmapResponse {
 #[derive(Debug, Deserialize, Clone)]
 struct FastmailEmail {
     id: String,
+    #[serde(default, alias = "mailboxIds")]
+    mailbox_ids: BTreeMap<String, bool>,
     #[serde(default, alias = "threadId")]
     thread_id: Option<String>,
     #[serde(default, alias = "receivedAt")]
@@ -2709,6 +3014,66 @@ mod tests {
     }
 
     #[test]
+    fn archive_accepts_only_explicit_fastmail_message_ids() {
+        let parsed = Cli::try_parse_from([
+            "mailbridge",
+            "archive",
+            "--account",
+            "fastmail",
+            "--message-id",
+            "message-1",
+            "--message-id",
+            "message-2",
+        ])
+        .unwrap();
+        let CliCommand::Archive(args) = parsed.command else {
+            panic!("expected archive command");
+        };
+        assert_eq!(args.account, AccountKind::Fastmail);
+        assert_eq!(args.message_ids, ["message-1", "message-2"]);
+    }
+
+    #[test]
+    fn archive_update_moves_message_to_archive_and_removes_inbox() {
+        let body = email_set_archive_body("account-1", "message-1", "archive/id", "in/box~id");
+        let update = &body["methodCalls"][0][1]["update"]["message-1"];
+        assert_eq!(update["mailboxIds/archive~1id"], true);
+        assert_eq!(update["mailboxIds/in~1box~0id"], Value::Null);
+        assert_eq!(update.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn active_mailbox_ids_only_include_memberships() {
+        let mailbox_ids = BTreeMap::from([
+            ("inbox".to_string(), true),
+            ("archive".to_string(), false),
+            ("custom".to_string(), true),
+        ]);
+        assert_eq!(active_mailbox_ids(&mailbox_ids), ["custom", "inbox"]);
+    }
+
+    #[test]
+    fn archive_disposition_distinguishes_safe_and_unsafe_targets() {
+        let inbox_only = BTreeMap::from([("inbox".to_string(), true)]);
+        assert_eq!(
+            archive_disposition(&inbox_only, "inbox", "archive"),
+            ArchiveDisposition::NeedsMove
+        );
+
+        let archive_only = BTreeMap::from([("archive".to_string(), true)]);
+        assert_eq!(
+            archive_disposition(&archive_only, "inbox", "archive"),
+            ArchiveDisposition::AlreadyArchived
+        );
+
+        let other_only = BTreeMap::from([("custom".to_string(), true)]);
+        assert_eq!(
+            archive_disposition(&other_only, "inbox", "archive"),
+            ArchiveDisposition::NotInInboxOrArchive
+        );
+    }
+
+    #[test]
     fn draft_command_does_not_expose_send_subcommand() {
         let parsed = Cli::try_parse_from(["mailbridge", "draft", "send"]);
         assert!(parsed.is_err());
@@ -2758,7 +3123,10 @@ mod tests {
         let cwd = env::current_dir().unwrap();
         let path = write_gmail_upload_mime("Subject: Test\r\n\r\nBody").unwrap();
         assert!(path.starts_with(cwd));
-        assert_eq!(fs::read_to_string(&path).unwrap(), "Subject: Test\r\n\r\nBody");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "Subject: Test\r\n\r\nBody"
+        );
         fs::remove_file(path).unwrap();
     }
 
