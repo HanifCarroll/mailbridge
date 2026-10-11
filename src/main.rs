@@ -77,6 +77,10 @@ struct SearchArgs {
     query: String,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    #[arg(long, help = "Fastmail only: return a page with continuation metadata")]
+    paged: bool,
+    #[arg(long, requires = "paged", help = "Zero-based Fastmail result offset")]
+    position: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -408,6 +412,14 @@ fn main() -> Result<()> {
             output(cli.json, &report, render_doctor(&report))
         }
         CliCommand::Search(args) => {
+            if args.paged {
+                if args.account != AccountKind::Fastmail {
+                    bail!("paged search is Fastmail-only");
+                }
+                let page =
+                    search_fastmail_page(&args.query, args.limit, args.position.unwrap_or(0))?;
+                return output(cli.json, &page, render_search(&page.messages));
+            }
             let messages = search_account(args.account, &args.query, args.limit)?;
             output(cli.json, &messages, render_search(&messages))
         }
@@ -1748,6 +1760,80 @@ fn search_fastmail(query: &str, limit: usize) -> Result<Vec<MessageSummary>> {
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FastmailQuery {
+    ids: Vec<String>,
+    position: usize,
+    query_state: String,
+    total: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FastmailSearchPage {
+    messages: Vec<MessageSummary>,
+    position: usize,
+    query_state: String,
+    total: usize,
+    next_position: Option<usize>,
+}
+
+fn search_fastmail_page(query: &str, limit: usize, position: usize) -> Result<FastmailSearchPage> {
+    if !(1..=100).contains(&limit) {
+        bail!("paged search limit must be between 1 and 100");
+    }
+    let acct = account(AccountKind::Fastmail);
+    let client = FastmailClient::new(Path::new(&acct.config))?;
+    let result = client.email_query_at(Some(query), limit, position, true)?;
+    let messages = client.email_get(&result.ids, false)?;
+    fastmail_search_page(result, messages, position, limit)
+}
+
+fn fastmail_search_page(
+    result: FastmailQuery,
+    messages: Vec<FastmailEmail>,
+    position: usize,
+    limit: usize,
+) -> Result<FastmailSearchPage> {
+    let total = result
+        .total
+        .context("paged Email/query response missing total")?;
+    if result.position != position || result.query_state.is_empty() || result.ids.len() > limit {
+        bail!("invalid paged Email/query response");
+    }
+    let end = position
+        .checked_add(result.ids.len())
+        .context("page offset overflow")?;
+    if (!result.ids.is_empty() && end > total) || (result.ids.is_empty() && position < total) {
+        bail!("invalid paged Email/query result count");
+    }
+    let mut messages = messages
+        .into_iter()
+        .map(|m| (m.id.clone(), summarize_fastmail_message(m)))
+        .collect::<BTreeMap<_, _>>();
+    // Email/get need not preserve Email/query order; never advance past an unresolved ID.
+    let ordered = result
+        .ids
+        .iter()
+        .map(|id| {
+            messages
+                .remove(id)
+                .context("Fastmail search changed during record lookup; restart the search")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !messages.is_empty() {
+        bail!("Email/get returned records outside the search page");
+    }
+    Ok(FastmailSearchPage {
+        messages: ordered,
+        position,
+        query_state: result.query_state,
+        total,
+        next_position: (end < total).then_some(end),
+    })
+}
+
 fn read_fastmail(message_id: &str, include_body: bool) -> Result<MessageDetail> {
     let acct = account(AccountKind::Fastmail);
     let client = FastmailClient::new(Path::new(&acct.config))?;
@@ -2169,6 +2255,16 @@ impl FastmailClient {
     }
 
     fn email_query(&self, text: Option<&str>, limit: usize) -> Result<Vec<String>> {
+        Ok(self.email_query_at(text, limit, 0, false)?.ids)
+    }
+
+    fn email_query_at(
+        &self,
+        text: Option<&str>,
+        limit: usize,
+        position: usize,
+        calculate_total: bool,
+    ) -> Result<FastmailQuery> {
         let session = self.session()?;
         let account_id = session.mail_account_id()?;
         let filter = text
@@ -2178,6 +2274,8 @@ impl FastmailClient {
         let mut args = json!({
             "accountId": account_id,
             "limit": limit,
+            "position": position,
+            "calculateTotal": calculate_total,
             "sort": [{ "property": "receivedAt", "isAscending": false }]
         });
         if let Some(filter) = filter {
@@ -2190,15 +2288,8 @@ impl FastmailClient {
                 "methodCalls": [["Email/query", args, "q"]]
             }),
         )?;
-        let ids = response
-            .method_response("Email/query")?
-            .get("ids")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("Email/query response missing ids"))?
-            .iter()
-            .filter_map(|value| value.as_str().map(str::to_string))
-            .collect();
-        Ok(ids)
+        serde_json::from_value(response.method_response("Email/query")?.clone())
+            .context("parse Email/query response")
     }
 
     fn email_get(&self, ids: &[String], include_body: bool) -> Result<Vec<FastmailEmail>> {
@@ -2987,6 +3078,76 @@ mod tests {
         let threads: Vec<FastmailThread> = serde_json::from_value(list).unwrap();
 
         assert_eq!(threads[0].email_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn fastmail_pages_preserve_query_order_and_advance_by_returned_count() {
+        let query = serde_json::from_value(
+            json!({"ids": ["a", "b"], "position": 3, "queryState": "state", "total": 7}),
+        )
+        .unwrap();
+        let messages = serde_json::from_value(json!([{"id": "b"}, {"id": "a"}])).unwrap();
+        let page = fastmail_search_page(query, messages, 3, 5).unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|m| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(page.next_position, Some(5));
+        assert_eq!(page.total, 7);
+        assert_eq!(page.query_state, "state");
+        let last = serde_json::from_value(
+            json!({"ids": [], "position": 7, "queryState": "state", "total": 7}),
+        )
+        .unwrap();
+        assert!(
+            fastmail_search_page(last, vec![], 7, 5)
+                .unwrap()
+                .next_position
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fastmail_pages_reject_missing_records_and_inconsistent_metadata() {
+        for raw in [
+            json!({"ids": ["missing"], "position": 0, "queryState": "state", "total": 1}),
+            json!({"ids": [], "position": 0, "queryState": "state", "total": 1}),
+            json!({"ids": [], "position": 1, "queryState": "state", "total": 0}),
+            json!({"ids": [], "position": 0, "queryState": "", "total": 0}),
+            json!({"ids": [], "position": 0, "queryState": "state"}),
+        ] {
+            assert!(
+                fastmail_search_page(serde_json::from_value(raw).unwrap(), vec![], 0, 5).is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "mailbridge",
+                "search",
+                "--account",
+                "fastmail",
+                "--position",
+                "1",
+                "x"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mailbridge",
+                "search",
+                "--account",
+                "fastmail",
+                "--paged",
+                "--position",
+                "1",
+                "x"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
