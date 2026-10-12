@@ -103,6 +103,14 @@ mailbridge --json search --account fastmail --paged --position 10 --limit 10 -- 
 
 Paged output contains `messages`, `position`, `queryState`, `total` and `nextPosition`. Continue at the returned `nextPosition` until it is `null`; the page limit is 1–100. Compare `queryState` across pages with the same query and restart if it changes, because the ordered matching records may have changed. Records retain `Email/query` order even when `Email/get` returns a different order. A missing record fails the page instead of silently advancing past it. These are read-only JMAP queries; see the [JMAP query specification](https://www.rfc-editor.org/rfc/rfc8620.html#section-5.5).
 
+Paged Fastmail search also accepts `--after`/`--before` RFC3339 timestamps, repeated `--folder` names/roles/IDs, `--exclude-spam-trash`, and `--oldest`. Selected folders are alternatives; spam/trash exclusion rejects any message with either membership, even when it also belongs to another folder. Search and original reads include folder names, IDs and roles. The legacy unpaged search array is unchanged.
+
+```sh
+mailbridge --json search --account fastmail --paged --folder Archive --after 2024-01-01T00:00:00Z --before 2025-01-01T00:00:00Z --oldest --exclude-spam-trash -- "invoice"
+```
+
+Thread output includes `partial`; it is true when native thread lookup fell back to the bounded recent-message scan. Callers must not interpret that fallback as complete history.
+
 ## Draft Specs
 
 `draft create` creates a provider draft and never sends it. The command has no send subcommand and does not call Gmail `drafts.send` or JMAP `EmailSubmission/set`.

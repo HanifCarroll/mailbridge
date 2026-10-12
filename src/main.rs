@@ -81,6 +81,16 @@ struct SearchArgs {
     paged: bool,
     #[arg(long, requires = "paged", help = "Zero-based Fastmail result offset")]
     position: Option<usize>,
+    #[arg(long, requires = "paged")]
+    after: Option<String>,
+    #[arg(long, requires = "paged")]
+    before: Option<String>,
+    #[arg(long = "folder", requires = "paged")]
+    folders: Vec<String>,
+    #[arg(long, requires = "paged")]
+    exclude_spam_trash: bool,
+    #[arg(long, requires = "paged")]
+    oldest: bool,
 }
 
 #[derive(Debug, Args)]
@@ -222,6 +232,8 @@ struct MessageSummary {
     date: Option<String>,
     snippet: Option<String>,
     attachment_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    folders: Vec<FastmailMailbox>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -261,6 +273,8 @@ struct AttachmentDownloadManifest {
 
 #[derive(Debug, Serialize)]
 struct ThreadDetail {
+    #[serde(default)]
+    partial: bool,
     account: AccountKind,
     backend: String,
     thread_id: String,
@@ -416,8 +430,7 @@ fn main() -> Result<()> {
                 if args.account != AccountKind::Fastmail {
                     bail!("paged search is Fastmail-only");
                 }
-                let page =
-                    search_fastmail_page(&args.query, args.limit, args.position.unwrap_or(0))?;
+                let page = search_fastmail_filtered(&args)?;
                 return output(cli.json, &page, render_search(&page.messages));
             }
             let messages = search_account(args.account, &args.query, args.limit)?;
@@ -1531,6 +1544,7 @@ fn thread_gmail(
         .map(|message| read_gmail(account_kind, &message.id, include_body))
         .collect::<Result<Vec<_>>>()?;
     Ok(ThreadDetail {
+        partial: false,
         account: account_kind,
         backend: acct.backend.to_string(),
         thread_id: thread_id.to_string(),
@@ -1676,6 +1690,7 @@ where
 fn summarize_gmail_message(account_kind: AccountKind, message: &GwsFullMessage) -> MessageSummary {
     let payload = message.payload.as_ref();
     MessageSummary {
+        folders: Vec::new(),
         account: account_kind,
         backend: "gmail-gws".to_string(),
         message_id: message.id.clone(),
@@ -1779,15 +1794,78 @@ struct FastmailSearchPage {
     next_position: Option<usize>,
 }
 
-fn search_fastmail_page(query: &str, limit: usize, position: usize) -> Result<FastmailSearchPage> {
-    if !(1..=100).contains(&limit) {
+fn search_fastmail_filtered(args: &SearchArgs) -> Result<FastmailSearchPage> {
+    if !(1..=100).contains(&args.limit) {
         bail!("paged search limit must be between 1 and 100");
     }
     let acct = account(AccountKind::Fastmail);
     let client = FastmailClient::new(Path::new(&acct.config))?;
-    let result = client.email_query_at(Some(query), limit, position, true)?;
+    let mailboxes = client.mailboxes()?;
+    let filter = fastmail_filter(args, &mailboxes)?;
+    let result = client.email_query_filtered(
+        Some(&args.query),
+        args.limit,
+        args.position.unwrap_or(0),
+        true,
+        filter,
+        args.oldest,
+    )?;
     let messages = client.email_get(&result.ids, false)?;
-    fastmail_search_page(result, messages, position, limit)
+    let membership = messages
+        .iter()
+        .map(|m| (m.id.clone(), active_mailbox_ids(&m.mailbox_ids)))
+        .collect::<BTreeMap<_, _>>();
+    let mut page = fastmail_search_page(result, messages, args.position.unwrap_or(0), args.limit)?;
+    for m in &mut page.messages {
+        m.folders = mailboxes
+            .iter()
+            .filter(|b| membership[&m.message_id].contains(&b.id))
+            .cloned()
+            .collect();
+    }
+    Ok(page)
+}
+fn fastmail_filter(args: &SearchArgs, mailboxes: &[FastmailMailbox]) -> Result<Option<Value>> {
+    let mut conditions = Vec::new();
+    for (name, date) in [
+        ("after", args.after.as_ref()),
+        ("before", args.before.as_ref()),
+    ] {
+        if let Some(date) = date {
+            chrono::DateTime::parse_from_rfc3339(date)
+                .context("date filter must be an RFC3339 timestamp")?;
+            conditions.push(json!({name:date}));
+        }
+    }
+    if args.exclude_spam_trash {
+        let ids = mailboxes
+            .iter()
+            .filter(|m| matches!(m.role.as_deref(), Some("junk" | "trash")))
+            .map(|m| m.id.clone())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            conditions.push(json!({"operator":"NOT","conditions":[{"operator":"OR","conditions":ids.into_iter().map(|id|json!({"inMailbox":id})).collect::<Vec<_>>()}]}));
+        }
+    }
+    if !args.folders.is_empty() {
+        let choices = args
+            .folders
+            .iter()
+            .map(|name| {
+                let m = mailboxes
+                    .iter()
+                    .find(|m| {
+                        m.id == *name
+                            || m.name.eq_ignore_ascii_case(name)
+                            || m.role.as_deref() == Some(name.as_str())
+                    })
+                    .with_context(|| format!("Unknown mail folder: {name}"))?;
+                Ok(json!({"inMailbox":m.id}))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        conditions.push(json!({"operator":"OR","conditions":choices}));
+    }
+    Ok((!conditions.is_empty()).then(|| json!({"operator":"AND","conditions":conditions})))
 }
 
 fn fastmail_search_page(
@@ -1841,13 +1919,22 @@ fn read_fastmail(message_id: &str, include_body: bool) -> Result<MessageDetail> 
     let message = messages
         .pop()
         .ok_or_else(|| anyhow!("Fastmail message not found: {message_id}"))?;
-    Ok(detail_fastmail_message(message))
+    let memberships = active_mailbox_ids(&message.mailbox_ids);
+    let mut detail = detail_fastmail_message(message);
+    detail.summary.folders = client
+        .mailboxes()?
+        .into_iter()
+        .filter(|m| memberships.contains(&m.id))
+        .collect();
+    Ok(detail)
 }
 
 fn thread_fastmail(thread_id: &str, scan_limit: usize, include_body: bool) -> Result<ThreadDetail> {
     let acct = account(AccountKind::Fastmail);
     let client = FastmailClient::new(Path::new(&acct.config))?;
+    let mut partial = false;
     let ids = client.thread_email_ids(thread_id).or_else(|_| {
+        partial = true;
         let ids = client.email_query(None, scan_limit)?;
         let messages = client.email_get(&ids, false)?;
         Ok::<Vec<String>, anyhow::Error>(
@@ -1870,6 +1957,7 @@ fn thread_fastmail(thread_id: &str, scan_limit: usize, include_body: bool) -> Re
         );
     }
     Ok(ThreadDetail {
+        partial,
         account: AccountKind::Fastmail,
         backend: "fastmail-jmap".to_string(),
         thread_id: thread_id.to_string(),
@@ -1879,6 +1967,7 @@ fn thread_fastmail(thread_id: &str, scan_limit: usize, include_body: bool) -> Re
 
 fn summarize_fastmail_message(message: FastmailEmail) -> MessageSummary {
     MessageSummary {
+        folders: Vec::new(),
         account: AccountKind::Fastmail,
         backend: "fastmail-jmap".to_string(),
         message_id: message.id,
@@ -2254,6 +2343,14 @@ impl FastmailClient {
         Ok((inbox_id, archive_id))
     }
 
+    fn mailboxes(&self) -> Result<Vec<FastmailMailbox>> {
+        let session = self.session()?;
+        let account_id = session.mail_account_id()?;
+        let response=self.api_call(&session.api_url,json!({"using":["urn:ietf:params:jmap:core","urn:ietf:params:jmap:mail"],"methodCalls":[["Mailbox/get",{"accountId":account_id,"properties":["id","name","role"]},"m"]]}))?;
+        serde_json::from_value(response.method_response("Mailbox/get")?["list"].clone())
+            .context("parse mailbox list")
+    }
+
     fn email_query(&self, text: Option<&str>, limit: usize) -> Result<Vec<String>> {
         Ok(self.email_query_at(text, limit, 0, false)?.ids)
     }
@@ -2264,6 +2361,18 @@ impl FastmailClient {
         limit: usize,
         position: usize,
         calculate_total: bool,
+    ) -> Result<FastmailQuery> {
+        self.email_query_filtered(text, limit, position, calculate_total, None, false)
+    }
+
+    fn email_query_filtered(
+        &self,
+        text: Option<&str>,
+        limit: usize,
+        position: usize,
+        calculate_total: bool,
+        extra: Option<Value>,
+        oldest: bool,
     ) -> Result<FastmailQuery> {
         let session = self.session()?;
         let account_id = session.mail_account_id()?;
@@ -2276,10 +2385,11 @@ impl FastmailClient {
             "limit": limit,
             "position": position,
             "calculateTotal": calculate_total,
-            "sort": [{ "property": "receivedAt", "isAscending": false }]
+            "sort": [{ "property": "receivedAt", "isAscending": oldest }]
         });
-        if let Some(filter) = filter {
-            args["filter"] = filter;
+        let conditions = [filter, extra].into_iter().flatten().collect::<Vec<_>>();
+        if !conditions.is_empty() {
+            args["filter"] = json!({"operator":"AND","conditions":conditions});
         }
         let response = self.api_call(
             &session.api_url,
@@ -2931,7 +3041,7 @@ struct FastmailThread {
     email_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct FastmailMailbox {
     id: String,
     name: String,
@@ -2980,6 +3090,57 @@ struct FastmailBodyValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paged_filters_resolve_folders_and_exclude_all_junk_memberships() {
+        let cli = Cli::try_parse_from([
+            "mailbridge",
+            "search",
+            "--account",
+            "fastmail",
+            "--paged",
+            "--after",
+            "2024-01-01T00:00:00Z",
+            "--before",
+            "2025-01-01T00:00:00Z",
+            "--folder",
+            "Archive",
+            "--exclude-spam-trash",
+            "--oldest",
+            "invoice",
+        ])
+        .unwrap();
+        let CliCommand::Search(mut args) = cli.command else {
+            panic!("expected search")
+        };
+        let boxes = vec![
+            FastmailMailbox {
+                id: "a".into(),
+                name: "Archive".into(),
+                role: Some("archive".into()),
+            },
+            FastmailMailbox {
+                id: "j".into(),
+                name: "Spam".into(),
+                role: Some("junk".into()),
+            },
+            FastmailMailbox {
+                id: "t".into(),
+                name: "Trash".into(),
+                role: Some("trash".into()),
+            },
+        ];
+        let filter = fastmail_filter(&args, &boxes).unwrap().unwrap();
+        assert_eq!(filter["conditions"][0]["after"], "2024-01-01T00:00:00Z");
+        assert_eq!(filter["conditions"][2]["operator"], "NOT");
+        assert_eq!(filter["conditions"][3]["conditions"][0]["inMailbox"], "a");
+        assert!(args.oldest);
+        args.after = Some("invalid".into());
+        assert!(fastmail_filter(&args, &boxes).is_err());
+        args.after = None;
+        args.folders = vec!["missing".into()];
+        assert!(fastmail_filter(&args, &boxes).is_err());
+    }
 
     #[test]
     fn maps_accounts_to_expected_backends() {
